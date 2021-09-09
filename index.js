@@ -8,6 +8,11 @@ console.log("\x1b[7m# Dishorde v" + pjson.version + " #\x1b[0m");
 console.log("NOTICE: Remote connections to 7 Days to Die servers are not encrypted. To keep your server secure, do not run this application on a public network, such as a public wi-fi hotspot. Be sure to use a unique telnet password.\n");
 
 var channel = void 0;
+// Allow for running multiple bots on the same system. Haven't seen any downsides to running multiple yet so I'm keeping this
+var port = Math.floor(1000 + Math.random() * 9000);
+// oldcount exists so we don't get stuck in a weird startup loop (purgatory)
+var numPlayers = 0;
+var oldcount;
 
 var d7dtdState = {
   doReconnect: 1,
@@ -118,7 +123,7 @@ if(config["allow-exec-command"] === true) {
 const configPrivate = {
   githubAuthor: "LakeYS",
   githubName: "Dishorde",
-  socketPort: 7383
+  socketPort: port
 };
 
 require("./lib/init.js")(pjson, config, configPrivate);
@@ -252,40 +257,64 @@ function handlePlayerCount(line, msg) {
 }
 
 ////// # Discord # //////
+function ResetTheFunny() {
+  oldcount = numPlayers;
+}
 
+function getPlayerCount() {
+  Telnet.exec("lp", (err, response) => {
+    if (!err) {
+      processTelnetResponse(response, (line) => {
+        if (line.startsWith("Total of ")) {
+          numPlayers = line.replace(/\D/g, '');
+          if (numPlayers != oldcount) {
+            client.user.setPresence({
+              activity: { name: `${numPlayers} players Online` },
+              status: "online"
+            });
+            // Kinda janky way of making sure we aren't unnecessarily running calls to discord 
+            oldcount = numPlayers;
+          }
+        }
+      });
+    }
+  });
+}
+setInterval(getPlayerCount, 6000);
+// This is mainly so it doesn't get stuck on loading when the server becomes inactive in chat or w/e.
+setInterval(ResetTheFunny, 300000);
 // updateDiscordStatus
 // NOTE: This function will 'cache' the current status to avoid re-sending it.
 // If you want to forcibly re-send the same status, set 'd7dtdState.connStatus' to -100 first.
 function updateDiscordStatus(status) {
   if(!config["disable-status-updates"]) {
     if(status === 0 && d7dtdState.connStatus !== 0) {
-      client.user.setPresence({ 
+      client.user.setPresence({
         activity: { name: `Connecting... | Type ${prefix}info` },
         status: "dnd"
       });
     } else if(status === -1 && d7dtdState.connStatus !== -1) {
-      client.user.setPresence({ 
+      client.user.setPresence({
         activity: { name: `Error | Type ${prefix}help` },
         status: "dnd"
       });
     } else if(status === 1 && d7dtdState.connStatus !== 1) {
       if(typeof config.channel === "undefined" || config.channel === "channelid") {
-        client.user.setPresence({ 
+        client.user.setPresence({
           activity: { name: `No channel | Type ${prefix}setchannel` },
           status: "idle"
         });
       }
-      else {
-        client.user.setPresence({ 
-          activity: { name: `7DTD | Type ${prefix}help` },
-          status: "online"
+      else
+        client.user.setPresence({
+          activity: { name: `Loading...` },
+          status: "idle"
         });
-      }
     }
-
-    // Update the status so we don't keep sending duplicates to Discord
-    d7dtdState.connStatus = status;
   }
+
+  // Update the status so we don't keep sending duplicates to Discord
+  d7dtdState.connStatus = status;
 }
 
 function refreshDiscordStatus() {
@@ -404,15 +433,15 @@ function parseDiscordCommand(msg, mentioned) {
       // -1 = Error, 0 = No connection/connecting, 1 = Online, -100 = Override or N/A (value is ignored)
       var statusMsg;
       switch(d7dtdState.connStatus) {
-      case -1:
-        statusMsg = ":red_circle: Error";
-        break;
-      case 0:
-        statusMsg = ":white_circle: Connecting...";
-        break;
-      case 1:
-        statusMsg = ":green_circle: Online";
-        break;
+        case -1:
+          statusMsg = ":red_circle: Error";
+          break;
+        case 0:
+          statusMsg = ":white_circle: Connecting...";
+          break;
+        case 1:
+          statusMsg = ":green_circle: Online";
+          break;
       }
 
       var cmdString = "";
@@ -424,8 +453,8 @@ function parseDiscordCommand(msg, mentioned) {
 
       var string = `Server connection: ${statusMsg}${cmdString}\n\n*Dishorde v${pjson.version} - Powered by discord.js ${pjson.dependencies["discord.js"].replace("^","")}.*`;
       msg.channel.send({embed: {
-        description: string
-      }})
+          description: string
+        }})
         .catch(() => {
           // If the embed fails, try sending without it.
           msg.channel.send(string);
@@ -450,6 +479,25 @@ function parseDiscordCommand(msg, mentioned) {
             if(!d7dtdState.receivedData) {
               d7dtdState.waitingForTime = 1;
               d7dtdState.waitingForTimeMsg = msg;
+            }
+          }
+          else {
+            handleCmdError(err);
+          }
+        });
+      }
+
+      // Save World
+      if (cmd === "SAVE" || cmd === "SAVEWORLD") {
+        Telnet.exec("sa", (err, response) => {
+          if (!err) {
+            processTelnetResponse(response, (line) => {
+              msg.channel.send("World has been saved");
+            });
+
+            if (!d7dtdState.receivedData) {
+              d7dtdState.waitingForVersion = 1;
+              d7dtdState.waitingForVersionMsg = msg;
             }
           }
           else {
@@ -501,7 +549,7 @@ function parseDiscordCommand(msg, mentioned) {
           }
         });
       }
-
+      
       //if(cmd === "PREF") {
       //  Telnet.exec("getgamepref", (err, response) => {
       //    if(!err) {
@@ -638,11 +686,11 @@ Telnet.on("data", (data) => {
       Telnet.destroy();
 
       channel.send({embed: {
-        color: 14164000,
-        description: "The server has shut down."
-      }})
+          color: 14164000,
+          description: "The server has shut down."
+        }})
         .catch(() => {
-        // Try re-sending without the embed if an error occurs.
+          // Try re-sending without the embed if an error occurs.
           channel.send("**The server has shut down.**")
             .catch((err) => {
               console.log("Failed to send message with error: " + err.message);
@@ -680,7 +728,7 @@ Telnet.on("error", (error) => {
 function doLogin() {
   client.login(token)
     .catch((error) => {
-    // We want the error event to trigger if this part fails.
+      // We want the error event to trigger if this part fails.
       client.emit("error", error);
     });
 }
